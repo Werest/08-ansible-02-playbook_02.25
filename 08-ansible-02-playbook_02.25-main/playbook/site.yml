@@ -27,16 +27,91 @@
       become: true
       ansible.builtin.dnf:  # Заменено yum на dnf с FQCN
         name:
-          - clickhouse-common-static-{{ clickhouse_version }}.rpm
           - clickhouse-client-{{ clickhouse_version }}.rpm
           - clickhouse-server-{{ clickhouse_version }}.rpm
+          - clickhouse-common-static-{{ clickhouse_version }}.rpm
+        disable_gpg_check: true  # TODO: разобраться с GPG
       notify: Start clickhouse service
 
     - name: Flush handlers
       ansible.builtin.meta: flush_handlers # Изменено на ansible.builtin.meta
 
+    # Ожидаем доступности сервера
+    # Гарантирует, что задача создания БД выполнится только после готовности ClickHouse.
+    - name: Wait for ClickHouse to start
+      ansible.builtin.wait_for:
+        host: localhost
+        port: 9000
+        timeout: 15
+        delay: 10
+        sleep: 5
+
     - name: Create database
-      ansible.builtin.command: "clickhouse-client -q 'create database logs;'"
+      ansible.builtin.command: "clickhouse-client -q 'create database if not exists logs;'"
       register: create_db
       failed_when: create_db.rc != 0 and create_db.rc != 82 # Добавлен пробел
       changed_when: create_db.rc == 0
+
+# При создании tasks рекомендую использовать модули: get_url, template, unarchive, file.
+- name: Install Vector
+  hosts: clickhouse
+  handlers:
+    - name: Start vector service
+      become: true
+      ansible.builtin.service:
+        name: vector
+        state: restarted
+  tasks:
+    - name: Create directory
+      ansible.builtin.file:
+        owner: "{{ ansible_ssh_user }}"
+        group: "{{ ansible_ssh_user }}"
+        path: "./vector-{{ vector_version }}"
+        state: directory
+        mode: '0755'
+
+    - name: Get vector distrib
+      ansible.builtin.get_url:
+        url: "https://packages.timber.io/vector/{{ vector_version }}/vector-{{ vector_version }}-x86_64-unknown-linux-musl.tar.gz"
+        dest: "./vector-{{ vector_version }}.tar.gz"
+        mode: '0644'
+
+    - name: Unpack vector
+      ansible.builtin.unarchive:
+        src: "vector-{{ vector_version }}.tar.gz"
+        dest: "./vector-{{ vector_version }}"
+        remote_src: true
+
+    - name: Copy file service vector
+      become: true
+      ansible.builtin.copy:
+        src: "./vector-{{ vector_version }}/vector-x86_64-unknown-linux-musl/etc/systemd/vector.service"
+        dest: "/etc/systemd/system"
+        remote_src: true
+        mode: '0644'
+
+    - name: Install vector
+      become: true
+      ansible.builtin.copy:
+        src: "./vector-{{ vector_version }}/vector-x86_64-unknown-linux-musl/bin/vector"
+        dest: "/usr/local/bin/"
+        remote_src: true
+        mode: '0755'
+
+    - name: Create vector configuration directory
+      become: true
+      ansible.builtin.file:
+        path: /etc/vector
+        state: directory
+        mode: '0755'
+
+    - name: Copy template vector
+      become: true
+      ansible.builtin.template:
+        src: "vector.yml.j2"
+        dest: "/etc/vector/vector.yaml"
+        mode: '0644'
+      notify: Start vector service
+
+    - name: Flush handlers
+      ansible.builtin.meta: flush_handlers # Изменено на ansible.builtin.meta
